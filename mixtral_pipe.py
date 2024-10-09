@@ -4,12 +4,25 @@ import transformers
 import accelerate
 from transformers.models.mixtral import modeling_mixtral
 
-from pipeline_model import ComputeMetrics, LayerSpec, PipelineModel, move_data_to_device, set_data
+from pipeline_model import (
+    ComputeMetrics,
+    LayerSpec,
+    PipelineModel,
+    move_data_to_device,
+    set_data,
+)
 from utils import DTYPE_MAP
 
 
 class EmbeddingPipe(nn.Module):
-    def __init__(self, loader_util, orig, attn_implementation, sliding_window, embedding_on_cpu=False):
+    def __init__(
+        self,
+        loader_util,
+        orig,
+        attn_implementation,
+        sliding_window,
+        embedding_on_cpu=False,
+    ):
         super().__init__()
         self.orig = orig
         self.attn_implementation = attn_implementation
@@ -21,8 +34,8 @@ class EmbeddingPipe(nn.Module):
         input_ids, attention_mask, position_ids, labels = inputs
         original_device = input_ids.device
         if self.embedding_on_cpu:
-            self.orig.to('cpu')
-            input_ids = input_ids.to('cpu')
+            self.orig.to("cpu")
+            input_ids = input_ids.to("cpu")
         inputs_embeds = self.orig(input_ids).to(original_device)
         batch_size, seq_length = input_ids.shape
 
@@ -32,12 +45,14 @@ class EmbeddingPipe(nn.Module):
             assert len(attention_mask.size()) == 2
         else:
             # 4d mask is passed through the layers
-            attention_mask = transformers.modeling_attn_mask_utils._prepare_4d_causal_attention_mask(
-                attention_mask,
-                (batch_size, seq_length),
-                inputs_embeds,
-                0,
-                sliding_window=self.sliding_window,
+            attention_mask = (
+                transformers.modeling_attn_mask_utils._prepare_4d_causal_attention_mask(
+                    attention_mask,
+                    (batch_size, seq_length),
+                    inputs_embeds,
+                    0,
+                    sliding_window=self.sliding_window,
+                )
             )
 
         hidden_states = inputs_embeds
@@ -80,6 +95,7 @@ class MixtralDecoderLayerPipe(nn.Module):
     def forward(self, inputs):
         def set_cpu_data():
             set_experts_data(self.orig.block_sparse_moe.experts, orig_data)
+
         def set_cpu_data_hook(grad):
             set_cpu_data()
             return None
@@ -89,12 +105,21 @@ class MixtralDecoderLayerPipe(nn.Module):
         if self.mlp_offloaded_to_cpu:
             if hidden_states.requires_grad:
                 hidden_states.register_hook(set_cpu_data_hook)
-            orig_data = move_experts_to_device(self.orig.block_sparse_moe.experts, hidden_states.device, self.num_experts_to_offload)
-        hidden_states, router_logits = self.orig(hidden_states, attention_mask=attention_mask, position_ids=position_ids, output_router_logits=True)
+            orig_data = move_experts_to_device(
+                self.orig.block_sparse_moe.experts,
+                hidden_states.device,
+                self.num_experts_to_offload,
+            )
+        hidden_states, router_logits = self.orig(
+            hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_router_logits=True,
+        )
         # TODO: fix unsloth gradient checkpointing when we return router logits
-        #router_logits = router_logits.to(torch.float32)
-        #router_logits = input_router_logits + (router_logits,)
-        #result = (hidden_states, attention_mask, position_ids, labels, *router_logits)
+        # router_logits = router_logits.to(torch.float32)
+        # router_logits = input_router_logits + (router_logits,)
+        # result = (hidden_states, attention_mask, position_ids, labels, *router_logits)
         result = (hidden_states, attention_mask, position_ids, labels)
         if self.mlp_offloaded_to_cpu and not torch.is_grad_enabled():
             set_cpu_data()
@@ -102,7 +127,9 @@ class MixtralDecoderLayerPipe(nn.Module):
 
     def offload_mlp_to_cpu(self):
         self.mlp_offloaded_to_cpu = True
-        move_experts_to_device(self.orig.block_sparse_moe.experts, 'cpu', self.num_experts_to_offload)
+        move_experts_to_device(
+            self.orig.block_sparse_moe.experts, "cpu", self.num_experts_to_offload
+        )
 
 
 class MixtralRMSNormPipe(nn.Module):
@@ -127,23 +154,44 @@ class LmHeadPipe(nn.Module):
         return self.lm_head(hidden_states), labels, *router_logits
 
 
-def load_balancing_loss_func(gate_logits: torch.Tensor, num_experts: torch.Tensor = None, top_k=2) -> float:
+def load_balancing_loss_func(
+    gate_logits: torch.Tensor, num_experts: torch.Tensor = None, top_k=2
+) -> float:
     if isinstance(gate_logits, tuple):
         compute_device = gate_logits[0].device
-        stacked_gate_logits = torch.stack([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0)
+        stacked_gate_logits = torch.stack(
+            [layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0
+        )
 
-    routing_weights = torch.nn.functional.softmax(stacked_gate_logits, dim=-1) # [num_layers, num_tokens, num_experts]
-    _, selected_experts = torch.topk(routing_weights, top_k, dim=-1) # [num_layers, num_tokens, top_k]
-    expert_mask = torch.nn.functional.one_hot(selected_experts, num_experts) # [num_layers, num_tokens, top_k, num_experts]
+    routing_weights = torch.nn.functional.softmax(
+        stacked_gate_logits, dim=-1
+    )  # [num_layers, num_tokens, num_experts]
+    _, selected_experts = torch.topk(
+        routing_weights, top_k, dim=-1
+    )  # [num_layers, num_tokens, top_k]
+    expert_mask = torch.nn.functional.one_hot(
+        selected_experts, num_experts
+    )  # [num_layers, num_tokens, top_k, num_experts]
     # For a given token, determine if it was routed to a given expert. Think of this as a collection of top_k-hot vectors.
-    expert_mask = torch.max(expert_mask, dim=-2).values.float() # [num_layers, num_tokens, num_experts]
-    tokens_per_layer_and_expert = torch.mean(expert_mask, dim=-2) # [num_layers, num_experts]
-    router_prob_per_layer_and_expert = torch.mean(routing_weights, dim=-2) # [num_layers, num_experts]
-    return torch.mean(tokens_per_layer_and_expert * router_prob_per_layer_and_expert) * num_experts**2
+    expert_mask = torch.max(
+        expert_mask, dim=-2
+    ).values.float()  # [num_layers, num_tokens, num_experts]
+    tokens_per_layer_and_expert = torch.mean(
+        expert_mask, dim=-2
+    )  # [num_layers, num_experts]
+    router_prob_per_layer_and_expert = torch.mean(
+        routing_weights, dim=-2
+    )  # [num_layers, num_experts]
+    return (
+        torch.mean(tokens_per_layer_and_expert * router_prob_per_layer_and_expert)
+        * num_experts**2
+    )
 
 
 class MixtralComputeMetrics(ComputeMetrics):
-    def __init__(self, load_balancing_loss_coef, num_experts, num_experts_per_tok, **kwargs):
+    def __init__(
+        self, load_balancing_loss_coef, num_experts, num_experts_per_tok, **kwargs
+    ):
         super().__init__(**kwargs)
         self.load_balancing_loss_coef = load_balancing_loss_coef
         self.num_experts = num_experts
@@ -157,7 +205,9 @@ class MixtralComputeMetrics(ComputeMetrics):
             aux_loss = modeling_mixtral.load_balancing_loss_func(
                 router_logits, self.num_experts, self.num_experts_per_tok
             )
-            alternate_aux_loss = load_balancing_loss_func(router_logits, self.num_experts, self.num_experts_per_tok)
+            alternate_aux_loss = load_balancing_loss_func(
+                router_logits, self.num_experts, self.num_experts_per_tok
+            )
             loss = metrics[0]
             loss += self.load_balancing_loss_coef * aux_loss
             metrics = (loss, *metrics[1:], aux_loss, alternate_aux_loss)
@@ -166,26 +216,24 @@ class MixtralComputeMetrics(ComputeMetrics):
 
 class MixtralForCausalLMPipe(PipelineModel, transformers.MixtralForCausalLM):
     def __init__(self, config, quantization_config):
-        model_config = transformers.MixtralConfig.from_pretrained(config['model'])
-        model_config._attn_implementation = 'flash_attention_2'
-        torch.set_default_dtype(DTYPE_MAP[config.get('model_weight_dtype', 'bfloat16')])
+        model_config = transformers.MixtralConfig.from_pretrained(config["model"])
+        model_config._attn_implementation = "flash_attention_2"
+        torch.set_default_dtype(DTYPE_MAP[config.get("model_weight_dtype", "bfloat16")])
         with accelerate.init_empty_weights():
             transformers.MixtralForCausalLM.__init__(self, model_config)
             PipelineModel.__init__(self, config, quantization_config, model_config)
         torch.set_default_dtype(torch.float32)
-        self.load_balancing_loss_coef = config.get('load_balancing_loss_coef', None)
+        self.load_balancing_loss_coef = config.get("load_balancing_loss_coef", None)
         self.num_experts_to_offload = self.num_experts
-        if 'offload_mlp_to_cpu' in config and type(config['offload_mlp_to_cpu']) == int:
-            self.num_experts_to_offload = config['offload_mlp_to_cpu']
+        if "offload_mlp_to_cpu" in config and type(config["offload_mlp_to_cpu"]) == int:
+            self.num_experts_to_offload = config["offload_mlp_to_cpu"]
 
     def to_layer_specs(self):
         def initial_layer(inputs):
             input_ids, attention_mask, labels = inputs
             batch_size, seq_length = input_ids.shape[:2]
             device = input_ids.device
-            position_ids = torch.arange(
-                0, seq_length, dtype=torch.long, device=device
-            )
+            position_ids = torch.arange(0, seq_length, dtype=torch.long, device=device)
             position_ids = position_ids.unsqueeze(0)
             return input_ids, attention_mask, position_ids, labels
 
@@ -197,12 +245,34 @@ class MixtralForCausalLMPipe(PipelineModel, transformers.MixtralForCausalLM):
                 self.model.embed_tokens,
                 self.model.config._attn_implementation,
                 self.model.config.sliding_window,
-                embedding_on_cpu=not self.train_config['full_fine_tune']
-            )
+                embedding_on_cpu=not self.train_config["full_fine_tune"],
+            ),
         ]
         for block in self.model.layers:
-            result.append(LayerSpec(MixtralDecoderLayerPipe, self.loader_util, block, self.num_experts_to_offload))
-        result.append(LayerSpec(MixtralRMSNormPipe, self.loader_util, self.model.norm, _estimated_size=0))
-        result.append(LayerSpec(LmHeadPipe, self.loader_util, self.lm_head, _estimated_size=0))
-        result.append(LayerSpec(MixtralComputeMetrics, self.load_balancing_loss_coef, self.num_experts, self.num_experts_per_tok, focal_loss_gamma=self.focal_loss_gamma, _estimated_size=0))
+            result.append(
+                LayerSpec(
+                    MixtralDecoderLayerPipe,
+                    self.loader_util,
+                    block,
+                    self.num_experts_to_offload,
+                )
+            )
+        result.append(
+            LayerSpec(
+                MixtralRMSNormPipe, self.loader_util, self.model.norm, _estimated_size=0
+            )
+        )
+        result.append(
+            LayerSpec(LmHeadPipe, self.loader_util, self.lm_head, _estimated_size=0)
+        )
+        result.append(
+            LayerSpec(
+                MixtralComputeMetrics,
+                self.load_balancing_loss_coef,
+                self.num_experts,
+                self.num_experts_per_tok,
+                focal_loss_gamma=self.focal_loss_gamma,
+                _estimated_size=0,
+            )
+        )
         return result
