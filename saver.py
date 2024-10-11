@@ -55,7 +55,7 @@ class Saver:
     def save_lora(self, name):
         dp_id = self.model_engine.grid.get_data_parallel_rank()
         stage_id = self.model_engine.grid.get_pipe_parallel_rank()
-        save_dir = self.save_root + name
+        save_dir = self.save_root / name
         tmp_dir = save_dir / "tmp"
         if dp_id == 0 and stage_id == 0:
             os.makedirs(tmp_dir, exist_ok=False)
@@ -96,8 +96,8 @@ class Saver:
     def save_full_model(self, name, max_shard_size="5GB"):
         dp_id = self.model_engine.grid.get_data_parallel_rank()
         stage_id = self.model_engine.grid.get_pipe_parallel_rank()
-        save_dir = self.save_root + name
-        tmp_dir = os.path.join(save_dir, "tmp")
+        save_dir = self.save_root / name
+        tmp_dir = save_dir / "tmp"
         if dp_id == 0 and stage_id == 0:
             os.makedirs(tmp_dir, exist_ok=False)
         deepspeed.comm.barrier()
